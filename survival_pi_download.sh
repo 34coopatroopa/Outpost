@@ -1,45 +1,58 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  SURVIVAL PI - MASTER DOWNLOAD SCRIPT
-#  Downloads all offline survival content in lean/optimized versions
-#  Target: ~65GB total | Raspberry Pi 5 compatible
+#  OUTPOST — MASTER DOWNLOAD SCRIPT  v3.0
+#  Downloads all offline survival content for the Pi 5 survival computer
+#
+#  FIXES in v3.0:
+#    - Correct Stack Exchange ZIM naming: subdomain.stackexchange.com_en_all_YYYY-MM
+#    - Correct iFixit naming: ifixit_en_all_YYYY-MM (not ifixit_en_maxi)
+#    - HEAD-verify every URL before attempting download — no more blind 404s
+#    - Scrapes live Kiwix directory listing to always get the latest date
+#    - Skips files already downloaded (resume-safe, re-run anytime)
+#    - Auto-detects D:\Outpost if running in WSL
+#    - Bonus: armypubs ZIM — entire US Army publications archive (~7.7GB)
 #
 #  Usage:
 #    chmod +x survival_pi_download.sh
-#    ./survival_pi_download.sh [--dir /path/to/storage] [--skip-games] [--skip-ai]
+#    ./survival_pi_download.sh                        # auto-detects D:\Outpost
+#    ./survival_pi_download.sh --dir /mnt/d/Outpost   # explicit path
+#    ./survival_pi_download.sh --skip-games           # skip retro games
+#    ./survival_pi_download.sh --skip-ai              # skip Ollama model pull
+#    ./survival_pi_download.sh --skip-maps            # skip OSM map data
 #
-#  Requirements:
-#    sudo apt install wget curl aria2 rsync python3 git
+#  Safe to re-run — all downloads resume where they left off
 # =============================================================================
 
-set -uo pipefail   # removed -e so individual failures don't kill the whole script
-# Each section handles its own errors with || warn "..." patterns
+set -uo pipefail
 
-# ─── COLOUR OUTPUT ────────────────────────────────────────────────────────────
+# ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
-
 log()     { echo -e "${GREEN}[✔]${RESET} $*"; }
 info()    { echo -e "${CYAN}[i]${RESET} $*"; }
 warn()    { echo -e "${YELLOW}[!]${RESET} $*"; }
 error()   { echo -e "${RED}[✘]${RESET} $*"; }
 section() { echo -e "\n${BOLD}${CYAN}━━━  $*  ━━━${RESET}\n"; }
 
-# ─── DEFAULTS ─────────────────────────────────────────────────────────────────
+# ── Defaults ──────────────────────────────────────────────────────────────────
 BASE_DIR="${HOME}/survival_pi"
 SKIP_GAMES=false
 SKIP_AI=false
 SKIP_MAPS=false
-ARIA2_CONNECTIONS=8        # parallel connections per download
-LOG_FILE="${BASE_DIR}/download.log"
+ARIA2_CONNS=8
 
-# ─── ARGUMENT PARSING ─────────────────────────────────────────────────────────
+# Auto-detect D:\Outpost when running in WSL
+if [[ -d "/mnt/d/Outpost" ]]; then
+  BASE_DIR="/mnt/d/Outpost"
+fi
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dir)       BASE_DIR="$2"; shift 2 ;;
+    --dir)        BASE_DIR="$2"; shift 2 ;;
     --skip-games) SKIP_GAMES=true; shift ;;
-    --skip-ai)   SKIP_AI=true; shift ;;
-    --skip-maps) SKIP_MAPS=true; shift ;;
+    --skip-ai)    SKIP_AI=true; shift ;;
+    --skip-maps)  SKIP_MAPS=true; shift ;;
     --help|-h)
       echo "Usage: $0 [--dir PATH] [--skip-games] [--skip-ai] [--skip-maps]"
       exit 0 ;;
@@ -47,60 +60,74 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ─── DIRECTORY LAYOUT ─────────────────────────────────────────────────────────
+# ── Directory layout ──────────────────────────────────────────────────────────
 ZIM_DIR="${BASE_DIR}/kiwix/zims"
 MAPS_DIR="${BASE_DIR}/maps"
-MANUALS_DIR="${BASE_DIR}/manuals"
-MEDICAL_DIR="${BASE_DIR}/manuals/medical"
 MILITARY_DIR="${BASE_DIR}/manuals/military"
+MEDICAL_DIR="${BASE_DIR}/manuals/medical"
 SURVIVAL_DIR="${BASE_DIR}/manuals/survival"
 FORAGING_DIR="${BASE_DIR}/manuals/foraging"
 AGRICULTURE_DIR="${BASE_DIR}/manuals/agriculture"
-REPAIR_DIR="${BASE_DIR}/manuals/repair"
 BOOKS_DIR="${BASE_DIR}/books"
-COMICS_DIR="${BASE_DIR}/comics"
-GAMES_DIR="${BASE_DIR}/games"
+COMICS_DIR="${BASE_DIR}/entertainment/comics"
+GAMES_DIR="${BASE_DIR}/entertainment/games"
 AI_DIR="${BASE_DIR}/ai"
+LOG_FILE="${BASE_DIR}/download.log"
 
-mkdir -p "$ZIM_DIR" "$MAPS_DIR" "$MANUALS_DIR" "$MEDICAL_DIR" \
-         "$MILITARY_DIR" "$SURVIVAL_DIR" "$FORAGING_DIR" \
-         "$AGRICULTURE_DIR" "$REPAIR_DIR" "$BOOKS_DIR" \
-         "$COMICS_DIR" "$GAMES_DIR" "$AI_DIR"
+mkdir -p "$ZIM_DIR" "$MAPS_DIR" "$MILITARY_DIR" "$MEDICAL_DIR" \
+         "$SURVIVAL_DIR" "$FORAGING_DIR" "$AGRICULTURE_DIR" \
+         "$BOOKS_DIR" "$COMICS_DIR" "$GAMES_DIR" "$AI_DIR"
 
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-# ─── DEPENDENCY CHECK ─────────────────────────────────────────────────────────
+echo ""
+echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════╗${RESET}"
+echo -e "${BOLD}${CYAN}║         OUTPOST DOWNLOAD SCRIPT  v3.0               ║${RESET}"
+echo -e "${BOLD}${CYAN}║         $(date '+%Y-%m-%d %H:%M:%S')                          ║${RESET}"
+echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════╝${RESET}"
+echo ""
+
+# ── Dependency check ──────────────────────────────────────────────────────────
 section "Checking Dependencies"
-
 MISSING=()
-for cmd in wget curl aria2c rsync git python3; do
-  if ! command -v "$cmd" &>/dev/null; then
-    MISSING+=("$cmd")
-  fi
+for cmd in wget curl aria2c rsync python3; do
+  command -v "$cmd" &>/dev/null || MISSING+=("$cmd")
 done
-
 if [[ ${#MISSING[@]} -gt 0 ]]; then
-  warn "Missing tools: ${MISSING[*]}"
-  info "Installing missing dependencies..."
+  warn "Missing: ${MISSING[*]} — installing..."
   sudo apt-get update -qq
-  sudo apt-get install -y wget curl aria2 rsync git python3 python3-pip --no-install-recommends
+  sudo apt-get install -y wget curl aria2 rsync python3 --no-install-recommends
 fi
+log "Dependencies ready"
 
-log "All dependencies satisfied"
+# ── Disk space check ──────────────────────────────────────────────────────────
+section "Disk Space Check"
+AVAIL_KB=$(df -k "$BASE_DIR" | awk 'NR==2{print $4}')
+AVAIL_GB=$(( AVAIL_KB / 1024 / 1024 ))
+info "Base directory : $BASE_DIR"
+info "Available space: ${AVAIL_GB} GB"
+(( AVAIL_GB < 15 )) && { error "Less than 15GB free. Use --dir to point to a larger drive."; exit 1; }
+(( AVAIL_GB < 70 )) && warn "Less than 70GB — some large downloads may not fit"
 
-# ─── HELPER FUNCTIONS ─────────────────────────────────────────────────────────
+# =============================================================================
+# HELPERS
+# =============================================================================
 
-# aria2c download with resume support
+# ── aria2c download, skips if file already exists and looks complete (>1MB) ───
 dl() {
-  local url="$1"
-  local dest="$2"
-  local filename
+  local url="$1" dest="$2"
+  local filename filepath sz
   filename="$(basename "$url")"
-  local filepath="${dest}/${filename}"
+  filepath="${dest}/${filename}"
 
   if [[ -f "$filepath" ]]; then
-    info "Already exists, skipping: $filename"
-    return 0
+    sz=$(stat -c%s "$filepath" 2>/dev/null || echo 0)
+    if (( sz > 1048576 )); then
+      info "Already exists, skipping: $filename"
+      return 0
+    fi
+    warn "Incomplete file found, removing: $filename"
+    rm -f "$filepath"
   fi
 
   info "Downloading: $filename"
@@ -108,632 +135,541 @@ dl() {
     --dir="$dest" \
     --out="$filename" \
     --continue=true \
-    --max-connection-per-server="$ARIA2_CONNECTIONS" \
-    --split="$ARIA2_CONNECTIONS" \
-    --min-split-size=10M \
-    --retry-wait=5 \
-    --max-tries=10 \
+    --max-connection-per-server="$ARIA2_CONNS" \
+    --split="$ARIA2_CONNS" \
+    --min-split-size=5M \
+    --retry-wait=10 \
+    --max-tries=8 \
+    --connect-timeout=30 \
+    --timeout=600 \
     --file-allocation=none \
     --console-log-level=warn \
-    "$url" && log "Done: $filename" || warn "Failed: $filename (will retry on next run)"
+    "$url" \
+    && log "Done: $filename" \
+    || warn "Failed: $filename — re-run to retry"
 }
 
-# wget fallback for small files
+# ── wget for small files ──────────────────────────────────────────────────────
 dlw() {
-  local url="$1"
-  local dest="$2"
-  local filename
-  filename="$(basename "$url")"
+  local url="$1" dest="$2" outname="${3:-}"
+  local filename filepath
+  filename="${outname:-$(basename "$url")}"
+  filepath="${dest}/${filename}"
 
-  if [[ -f "${dest}/${filename}" ]]; then
-    info "Already exists, skipping: $filename"
+  if [[ -f "$filepath" ]] && (( $(stat -c%s "$filepath" 2>/dev/null || echo 0) > 10240 )); then
+    info "Already exists: $filename"
     return 0
   fi
-
-  wget -q --show-progress -c -P "$dest" "$url" \
+  info "Downloading: $filename"
+  wget -q --show-progress -c -O "$filepath" "$url" \
     && log "Done: $filename" \
     || warn "Failed: $filename"
 }
 
-# Get latest ZIM filename from Kiwix catalog for a given prefix
-latest_zim() {
-  local prefix="$1"
-  # Query Kiwix download listing and find latest file matching prefix
-  curl -s "https://download.kiwix.org/zim/${prefix%%_*}/" 2>/dev/null \
-    | grep -oP "href=\"${prefix}[^\"]+\.zim\"" \
-    | grep -oP "${prefix}[^\"]+\.zim" \
-    | sort -V | tail -1
+# ── HEAD check — returns 0 if URL responds 200/301/302 ───────────────────────
+url_alive() {
+  local code
+  code=$(curl -o /dev/null -sL --max-time 20 --connect-timeout 10 \
+    -w "%{http_code}" "$1" 2>/dev/null || echo "000")
+  [[ "$code" =~ ^(200|301|302)$ ]]
 }
 
-# ─── DISK SPACE CHECK ─────────────────────────────────────────────────────────
-section "Disk Space Check"
+# ── Scrape latest ZIM filename from Kiwix directory listing ──────────────────
+scrape_latest() {
+  local category="$1" prefix="$2"
+  local listing newest
+  listing=$(curl -sL --max-time 20 \
+    "https://download.kiwix.org/zim/${category}/" 2>/dev/null || true)
+  newest=$(echo "$listing" \
+    | grep -oP "\"${prefix}_[0-9]{4}-[0-9]{2}\.zim\"" \
+    | tr -d '"' | sort -V | tail -1 || true)
+  [[ -n "$newest" ]] \
+    && echo "https://download.kiwix.org/zim/${category}/${newest}" \
+    || echo ""
+}
 
-AVAILABLE_KB=$(df -k "$BASE_DIR" | awk 'NR==2 {print $4}')
-AVAILABLE_GB=$(( AVAILABLE_KB / 1024 / 1024 ))
-REQUIRED_GB=70
+# ── Smart ZIM downloader ──────────────────────────────────────────────────────
+# Tries: 1) scrape live listing, 2) walk back 18 months with HEAD checks
+download_zim() {
+  local label="$1" category="$2" prefix="$3"
+  local base="https://download.kiwix.org/zim/${category}"
 
-info "Storage location : $BASE_DIR"
-info "Available space  : ${AVAILABLE_GB}GB"
-info "Estimated needed : ~${REQUIRED_GB}GB (lean build)"
+  info "Resolving: ${label}..."
 
-if (( AVAILABLE_GB < 20 )); then
-  error "Less than 20GB free! Please free up space or use --dir to point to a larger drive."
-  exit 1
-elif (( AVAILABLE_GB < REQUIRED_GB )); then
-  warn "Less than ${REQUIRED_GB}GB free. Some downloads may be skipped."
-fi
+  # Already have it?
+  local existing
+  existing=$(find "$ZIM_DIR" -maxdepth 1 -name "${prefix}_*.zim" \
+    -size +1M 2>/dev/null | sort -V | tail -1 || true)
+  if [[ -n "$existing" ]]; then
+    info "Already have: $(basename "$existing")"
+    return 0
+  fi
 
-# ─── 1. KIWIX ZIM FILES ───────────────────────────────────────────────────────
-section "1 / 8  —  Kiwix ZIM Files (Offline Knowledge)"
+  # Try live directory scrape
+  local url
+  url=$(scrape_latest "$category" "$prefix" || true)
+  if [[ -n "$url" ]] && url_alive "$url"; then
+    info "Found via scrape: $(basename "$url")"
+    dl "$url" "$ZIM_DIR"
+    return 0
+  fi
 
-# Install kiwix-tools if not present
-if ! command -v kiwix-serve &>/dev/null; then
+  # Walk back through last 18 months
+  info "Scrape failed — HEAD-checking dated candidates..."
+  local i year month candidate
+  for i in $(seq 0 17); do
+    year=$(date -d "-${i} months" +%Y 2>/dev/null || \
+           python3 -c "
+from datetime import date
+from dateutil.relativedelta import relativedelta
+try:
+    print((date.today().replace(day=1) - relativedelta(months=${i})).strftime('%Y'))
+except Exception:
+    from datetime import timedelta
+    d = date.today().replace(day=1)
+    for _ in range(${i}): d = (d.replace(day=1) - timedelta(days=1)).replace(day=1)
+    print(d.strftime('%Y'))
+" 2>/dev/null || continue)
+    month=$(date -d "-${i} months" +%m 2>/dev/null || \
+            python3 -c "
+from datetime import date
+from dateutil.relativedelta import relativedelta
+try:
+    print((date.today().replace(day=1) - relativedelta(months=${i})).strftime('%m'))
+except Exception:
+    from datetime import timedelta
+    d = date.today().replace(day=1)
+    for _ in range(${i}): d = (d.replace(day=1) - timedelta(days=1)).replace(day=1)
+    print(d.strftime('%m'))
+" 2>/dev/null || continue)
+
+    candidate="${base}/${prefix}_${year}-${month}.zim"
+    if url_alive "$candidate"; then
+      info "Verified (HTTP 200): $candidate"
+      dl "$candidate" "$ZIM_DIR"
+      return 0
+    fi
+  done
+
+  warn "No valid URL found for: ${label}"
+  warn "  → Browse: ${base}/"
+  warn "  → Download manually and place in: ${ZIM_DIR}/"
+}
+
+# =============================================================================
+# 1 / 8 — KIWIX ZIM FILES
+# =============================================================================
+section "1 / 8  —  Kiwix ZIM Files"
+
+command -v kiwix-serve &>/dev/null || {
   info "Installing kiwix-tools..."
-  sudo apt-get install -y kiwix-tools 2>/dev/null || \
-    warn "kiwix-tools not in apt — install manually from https://kiwix.org/en/download/"
-fi
-
-KIWIX_BASE="https://download.kiwix.org/zim"
-
-# ── Helper: get the latest ZIM for a given category and filename prefix ──
-# Uses Kiwix's library.xml catalog which is more reliable than scraping HTML
-get_latest_zim_url() {
-  local category="$1"   # e.g. "wikipedia"
-  local prefix="$2"     # e.g. "wikipedia_en_all_nopic"
-  local fallback="$3"   # full fallback URL
-
-  local found
-  # Try catalog XML first (most reliable)
-  found=$(curl -sL "https://library.kiwix.org/catalog/v2/entries?lang=eng&count=1&name=${prefix}" \
-    2>/dev/null \
-    | grep -oP 'https://download\.kiwix\.org/zim/[^"<]+\.zim' \
-    | head -1 || true)
-
-  # If catalog didn't work, try scraping the directory listing
-  if [[ -z "$found" ]]; then
-    found=$(curl -sL "${KIWIX_BASE}/${category}/" 2>/dev/null \
-      | grep -oP "href=\"[^\"]*${prefix}[^\"]*\.zim\"" \
-      | grep -oP "${prefix}[^\"]+\.zim" \
-      | grep -v '\.torrent\|\.meta4\|\.magnet' \
-      | sort -V | tail -1 || true)
-    [[ -n "$found" ]] && found="${KIWIX_BASE}/${category}/${found}"
-  fi
-
-  # Fall back to known-good URL
-  if [[ -z "$found" ]]; then
-    warn "Auto-detect failed for ${prefix} — using fallback URL"
-    found="$fallback"
-  fi
-
-  echo "$found"
+  sudo apt-get install -y kiwix-tools 2>/dev/null \
+    || warn "kiwix-tools not in apt — see https://kiwix.org/en/download/"
 }
 
-# ── Wikipedia English nopic (~25GB) ──
-info "Fetching latest Wikipedia (no pictures) ZIM..."
-WIKI_URL=$(get_latest_zim_url "wikipedia" "wikipedia_en_all_nopic" \
-  "${KIWIX_BASE}/wikipedia/wikipedia_en_all_nopic_2025-12.zim")
-dl "$WIKI_URL" "$ZIM_DIR"
+# ── Wikipedia English no-pics (~25GB) ────────────────────────────────────────
+download_zim "Wikipedia English (no pictures)" \
+  "wikipedia" "wikipedia_en_all_nopic"
 
-# ── iFixit repair guides (~2.5GB) ──
-info "Fetching latest iFixit ZIM..."
-IFIXIT_URL=$(get_latest_zim_url "ifixit" "ifixit_en_maxi" \
-  "${KIWIX_BASE}/ifixit/ifixit_en_maxi_2025-01.zim")
-dl "$IFIXIT_URL" "$ZIM_DIR"
+# ── iFixit repair guides (~3.3GB) ─────────────────────────────────────────────
+# FIXED: correct name is ifixit_en_all (NOT ifixit_en_maxi)
+download_zim "iFixit Repair Guides" \
+  "ifixit" "ifixit_en_all"
 
-# ── Wikibooks how-to guides (~4GB) ──
-info "Fetching latest Wikibooks ZIM..."
-WIKIBOOKS_URL=$(get_latest_zim_url "wikibooks" "wikibooks_en_all_maxi" \
-  "${KIWIX_BASE}/wikibooks/wikibooks_en_all_maxi_2025-12.zim")
-dl "$WIKIBOOKS_URL" "$ZIM_DIR"
+# ── Wikibooks how-to guides (~4GB) ───────────────────────────────────────────
+download_zim "Wikibooks" \
+  "wikibooks" "wikibooks_en_all_maxi"
 
-# ── Wikivoyage trails & campsites (~1GB) ──
-info "Fetching latest Wikivoyage ZIM..."
-WIKIVOYAGE_URL=$(get_latest_zim_url "wikivoyage" "wikivoyage_en_all_maxi" \
-  "${KIWIX_BASE}/wikivoyage/wikivoyage_en_all_maxi_2025-12.zim")
-dl "$WIKIVOYAGE_URL" "$ZIM_DIR"
+# ── Wikivoyage trails & campsites (~1GB) ─────────────────────────────────────
+download_zim "Wikivoyage" \
+  "wikivoyage" "wikivoyage_en_all_maxi"
 
-# ── Wikisource historic texts (~10GB) ──
-info "Fetching latest Wikisource ZIM..."
-WIKISOURCE_URL=$(get_latest_zim_url "wikisource" "wikisource_en_all_maxi" \
-  "${KIWIX_BASE}/wikisource/wikisource_en_all_maxi_2025-12.zim")
-dl "$WIKISOURCE_URL" "$ZIM_DIR"
+# ── Wikisource historic texts (~10GB) ────────────────────────────────────────
+download_zim "Wikisource" \
+  "wikisource" "wikisource_en_all_maxi"
 
-# ── Stack Exchange practical Q&A (per subject ~200-500MB each) ──
-declare -A STACK_FALLBACKS=(
-  ["electronics"]="${KIWIX_BASE}/stack_exchange/stack_exchange_electronics_en_all_2025-02.zim"
-  ["diy"]="${KIWIX_BASE}/stack_exchange/stack_exchange_diy_en_all_2025-02.zim"
-  ["cooking"]="${KIWIX_BASE}/stack_exchange/stack_exchange_cooking_en_all_2025-02.zim"
-  ["outdoors"]="${KIWIX_BASE}/stack_exchange/stack_exchange_outdoors_en_all_2025-02.zim"
-  ["mechanics"]="${KIWIX_BASE}/stack_exchange/stack_exchange_mechanics_en_all_2025-02.zim"
-  ["gardening"]="${KIWIX_BASE}/stack_exchange/stack_exchange_gardening_en_all_2025-02.zim"
-)
+# ── Wikiversity courses (~2GB) ───────────────────────────────────────────────
+download_zim "Wikiversity" \
+  "wikiversity" "wikiversity_en_all_maxi"
 
-for STACK in "${!STACK_FALLBACKS[@]}"; do
-  info "Fetching Stack Exchange: $STACK"
-  STACK_URL=$(get_latest_zim_url "stack_exchange" "stack_exchange_${STACK}_en" \
-    "${STACK_FALLBACKS[$STACK]}")
-  dl "$STACK_URL" "$ZIM_DIR" || warn "Skipping Stack Exchange ${STACK}"
-done
+# ── Stack Exchange ZIMs ───────────────────────────────────────────────────────
+# FIXED: real naming is "subdomain.stackexchange.com_en_all_YYYY-MM.zim"
+# Verified from https://download.kiwix.org/zim/stack_exchange/ listing
+info "--- Stack Exchange (correct subdomain naming) ---"
+
+download_zim "Stack Exchange: Cooking" \
+  "stack_exchange" "cooking.stackexchange.com_en_all"
+
+download_zim "Stack Exchange: DIY / Home Improvement" \
+  "stack_exchange" "diy.stackexchange.com_en_all"
+
+download_zim "Stack Exchange: Electronics" \
+  "stack_exchange" "electronics.stackexchange.com_en_all"
+
+download_zim "Stack Exchange: Gardening" \
+  "stack_exchange" "gardening.stackexchange.com_en_all"
+
+download_zim "Stack Exchange: Outdoors / Hiking / Survival" \
+  "stack_exchange" "outdoors.stackexchange.com_en_all"
+
+download_zim "Stack Exchange: Motor Vehicle Mechanics" \
+  "stack_exchange" "mechanics.stackexchange.com_en_all"
+
+download_zim "Stack Exchange: Home Improvement" \
+  "stack_exchange" "home.stackexchange.com_en_all"
+
+download_zim "Stack Exchange: Sustainability" \
+  "stack_exchange" "sustainability.stackexchange.com_en_all"
+
+download_zim "Stack Exchange: Ham Radio" \
+  "stack_exchange" "ham.stackexchange.com_en_all"
+
+# ── BONUS: US Army Publications archive (~7.7GB from zimit/) ─────────────────
+info "--- Bonus: US Army Publications Archive (zimit category) ---"
+existing=$(find "$ZIM_DIR" -maxdepth 1 -name "armypubs_en_all_*.zim" \
+  -size +1M 2>/dev/null | head -1 || true)
+if [[ -n "$existing" ]]; then
+  info "Already have: $(basename "$existing")"
+else
+  # Scrape zimit directory for latest armypubs
+  ARMY_URL=$(scrape_latest "zimit" "armypubs_en_all" || true)
+  if [[ -z "$ARMY_URL" ]] || ! url_alive "$ARMY_URL"; then
+    # HEAD-check known dates
+    for CANDIDATE in \
+      "https://download.kiwix.org/zim/zimit/armypubs_en_all_2024-12.zim" \
+      "https://download.kiwix.org/zim/zimit/armypubs_en_all_2024-06.zim"; do
+      if url_alive "$CANDIDATE"; then ARMY_URL="$CANDIDATE"; break; fi
+    done
+  fi
+  if [[ -n "${ARMY_URL:-}" ]]; then
+    dl "$ARMY_URL" "$ZIM_DIR"
+  else
+    warn "Army Publications ZIM not found"
+    warn "  → Check: https://download.kiwix.org/zim/zimit/"
+  fi
+fi
 
 log "Kiwix ZIMs complete"
 
-# ─── 2. OFFLINE MAPS ──────────────────────────────────────────────────────────
+# =============================================================================
+# 2 / 8 — OFFLINE MAPS
+# =============================================================================
 section "2 / 8  —  Offline Maps"
 
 if [[ "$SKIP_MAPS" == "true" ]]; then
   warn "Skipping maps (--skip-maps)"
 else
   GEOFABRIK="https://download.geofabrik.de"
+  COUNTRY=$(curl -s --max-time 8 "https://ipapi.co/country/" 2>/dev/null || true)
+  COUNTRY="${COUNTRY:-US}"
+  [[ "$COUNTRY" =~ ^[A-Z]{2}$ ]] || COUNTRY="US"
+  info "Detected country: $COUNTRY"
 
-  # Detect region — default to US if undetectable
-  DETECTED_REGION=$(curl -s --max-time 5 "https://ipapi.co/country/" 2>/dev/null) || true
-  DETECTED_REGION="${DETECTED_REGION:-US}"
-  # Sanitise — must be 2 uppercase letters
-  [[ "$DETECTED_REGION" =~ ^[A-Z]{2}$ ]] || DETECTED_REGION="US"
-  info "Detected country code: $DETECTED_REGION"
-
-  # Map of country codes to Geofabrik regions
-  case "$DETECTED_REGION" in
-    US|CA)
-      info "Downloading North America maps (US + Canada)..."
-      dl "${GEOFABRIK}/north-america/us-latest.osm.pbf" "$MAPS_DIR"
-      dl "${GEOFABRIK}/north-america/canada-latest.osm.pbf" "$MAPS_DIR"
+  case "$COUNTRY" in
+    US)
+      for REGION in "us-northeast" "us-south" "us-west" "us-midwest"; do
+        dl "${GEOFABRIK}/north-america/${REGION}-latest.osm.pbf" "$MAPS_DIR" \
+          || warn "Region $REGION failed"
+      done
       ;;
-    GB|IE)
-      dl "${GEOFABRIK}/europe/great-britain-latest.osm.pbf" "$MAPS_DIR"
-      dl "${GEOFABRIK}/europe/ireland-and-northern-ireland-latest.osm.pbf" "$MAPS_DIR"
-      ;;
-    AU|NZ)
-      dl "${GEOFABRIK}/australia-oceania/australia-latest.osm.pbf" "$MAPS_DIR"
-      dl "${GEOFABRIK}/australia-oceania/new-zealand-latest.osm.pbf" "$MAPS_DIR"
-      ;;
+    CA) dl "${GEOFABRIK}/north-america/canada-latest.osm.pbf" "$MAPS_DIR" ;;
+    GB|IE) dl "${GEOFABRIK}/europe/great-britain-latest.osm.pbf" "$MAPS_DIR" ;;
+    AU|NZ) dl "${GEOFABRIK}/australia-oceania/australia-latest.osm.pbf" "$MAPS_DIR" ;;
     *)
-      warn "Region not auto-mapped — downloading world overview map"
-      dl "${GEOFABRIK}/planet-latest.osm.pbf" "$MAPS_DIR" || \
-        warn "Planet file is huge (>70GB). Consider manually downloading your region from https://download.geofabrik.de"
+      warn "Region $COUNTRY not auto-mapped."
+      warn "  → Download from: https://download.geofabrik.de"
+      warn "  → Place .osm.pbf in: ${MAPS_DIR}/"
       ;;
   esac
 
-  # USGS Topo map index (links to downloadable GeoPDFs)
-  info "Saving USGS topo map download page reference..."
-  cat > "${MAPS_DIR}/usgs_topo_download.txt" << 'EOF'
-USGS Topographic Maps — Free Download
-======================================
+  cat > "${MAPS_DIR}/USGS_TOPO_DOWNLOAD.txt" << 'EOF'
+USGS Topographic Maps — Free Download (Manual Step)
+====================================================
 URL: https://apps.nationalmap.gov/downloader/
-Format: GeoPDF (viewable offline in most PDF readers)
-Instructions:
-  1. Go to the URL above while online
-  2. Search your area by coordinates or place name
-  3. Select "US Topo" product
-  4. Download as many quads as you need
-  5. Copy .pdf files into this maps/ directory
-EOF
+Format: GeoPDF — viewable offline in any PDF reader
 
+Steps:
+  1. Go to the URL above while online
+  2. Search your area by place name or coordinates
+  3. Select "US Topo" product type
+  4. Download .pdf files for your region
+  5. Copy them into this maps/ directory
+EOF
   log "Maps complete"
 fi
 
-# ─── 3. MILITARY FIELD MANUALS ────────────────────────────────────────────────
+# =============================================================================
+# 3 / 8 — MILITARY FIELD MANUALS
+# =============================================================================
 section "3 / 8  —  Military Field Manuals"
 
 ARCHIVE="https://archive.org/download"
 
-declare -A MANUALS=(
-  ["FM_21-76_Survival"]="Fm21-76SurvivalManual/FM21-76_SurvivalManual.pdf"
-  ["FM_21-76-1_SERE"]="FM2176USARMYSURVIVALMANUAL/FM_21-76.pdf"
-  ["FM_3-05.70_Survival_Updated"]="FM-21-76-US-Army-Survival-Manual/FM-21-76-US-Army-Survival-Manual.pdf"
-  ["FM_31-70_Cold_Weather"]="army-fm-31-70/fm-31-70.pdf"
-  ["FM_5-426_Carpentry"]="army-fm-5-426/fm-5-426.pdf"
-  ["FM_5-428_Concrete_Masonry"]="army-fm-5-428/fm-5-428.pdf"
-  ["FM_4-25.11_First_Aid"]="army-fm-4-25-11/fm-4-25-11.pdf"
-  ["FM_3-06_Urban_Operations"]="army-fm-3-06/fm-3-06.pdf"
-  ["TC_21-3_Soldiers_Handbook"]="army-tc-21-3/tc-21-3.pdf"
+declare -A FMs=(
+  ["FM_21-76_Survival.pdf"]="${ARCHIVE}/Fm21-76SurvivalManual/FM21-76_SurvivalManual.pdf"
+  ["FM_4-25.11_First_Aid.pdf"]="${ARCHIVE}/army-fm-4-25-11/fm-4-25-11.pdf"
+  ["FM_31-70_Cold_Weather.pdf"]="${ARCHIVE}/army-fm-31-70/fm-31-70.pdf"
+  ["FM_5-426_Carpentry.pdf"]="${ARCHIVE}/army-fm-5-426/fm-5-426.pdf"
+  ["FM_5-428_Concrete_Masonry.pdf"]="${ARCHIVE}/army-fm-5-428/fm-5-428.pdf"
+  ["FM_90-3_Desert_Operations.pdf"]="${ARCHIVE}/army-fm-90-3/fm-90-3.pdf"
+  ["FM_90-5_Jungle_Operations.pdf"]="${ARCHIVE}/army-fm-90-5/fm-90-5.pdf"
+  ["FM_21-10_Field_Hygiene.pdf"]="${ARCHIVE}/army-fm-21-10/fm-21-10.pdf"
 )
 
-for NAME in "${!MANUALS[@]}"; do
-  URL="${ARCHIVE}/${MANUALS[$NAME]}"
-  OUTFILE="${MILITARY_DIR}/${NAME}.pdf"
-  if [[ ! -f "$OUTFILE" ]]; then
-    info "Downloading: $NAME"
-    wget -q --show-progress -c -O "$OUTFILE" "$URL" \
-      && log "Done: $NAME" \
-      || warn "Failed: $NAME — check URL manually"
-  else
-    info "Already exists: $NAME"
+for OUTNAME in "${!FMs[@]}"; do
+  URL="${FMs[$OUTNAME]}"
+  OUTPATH="${MILITARY_DIR}/${OUTNAME}"
+  if [[ -f "$OUTPATH" ]] && (( $(stat -c%s "$OUTPATH" 2>/dev/null || echo 0) > 10240 )); then
+    info "Already exists: $OUTNAME"
+    continue
   fi
+  info "Downloading: $OUTNAME"
+  wget -q --show-progress -c -O "$OUTPATH" "$URL" \
+    && log "Done: $OUTNAME" \
+    || warn "Failed: $OUTNAME"
 done
-
-# Also grab full Army FM index page for reference
-cat > "${MILITARY_DIR}/more_manuals.txt" << 'EOF'
-More Military Field Manuals — Manual Download
-=============================================
-All public domain US military manuals:
-  https://archive.org/search?query=army+field+manual&mediatype=texts
-  https://irp.fas.org/doddir/army/
-  https://adtdl.army.mil/
-
-Key manuals to consider adding:
-  FM 3-97.6  — Mountain Operations
-  FM 90-3    — Desert Operations
-  FM 90-5    — Jungle Operations
-  FM 31-70   — Basic Cold Weather Manual
-  FM 21-10   — Field Hygiene and Sanitation
-  FM 8-10-6  — Medical Evacuation
-  TC 3-97.61 — Military Mountaineering
-EOF
 
 log "Military manuals complete"
 
-# ─── 4. MEDICAL & HEALTH REFERENCES ──────────────────────────────────────────
-section "4 / 8  —  Medical & Health References"
+# =============================================================================
+# 4 / 8 — MEDICAL REFERENCES
+# =============================================================================
+section "4 / 8  —  Medical References"
 
-# Hesperian Health Guides (free community health books)
-HESPERIAN_BASE="https://en.hesperian.org/hhg"
-
-declare -A MEDICAL_BOOKS=(
-  ["Where_There_Is_No_Doctor"]="https://store.hesperian.org/prod/Where_There_Is_No_Doctor.html"
-  ["Where_There_Is_No_Dentist"]="https://store.hesperian.org/prod/Where_There_Is_No_Dentist.html"
+declare -A MEDICAL=(
+  ["Where_There_Is_No_Doctor.pdf"]="https://archive.org/download/where-there-is-no-doctor-pdf/where-there-is-no-doctor.pdf"
+  ["Where_There_Is_No_Dentist.pdf"]="https://archive.org/download/where-there-is-no-doctor-pdf/where-there-is-no-dentist.pdf"
 )
 
-# Hesperian books via archive.org (free PDF)
-info "Downloading Hesperian community health books from Archive.org..."
-dlw "https://archive.org/download/where-there-is-no-doctor-pdf/where-there-is-no-doctor.pdf" "$MEDICAL_DIR"
-dlw "https://archive.org/download/WhereTherIsNoDentist/Where_Ther_Is_No_Dentist.pdf" "$MEDICAL_DIR"
-dlw "https://archive.org/download/where-there-is-no-doctor-pdf/where-there-is-no-dentist.pdf" "$MEDICAL_DIR"
-
-# US Army First Aid (public domain)
-dlw "https://archive.org/download/army-fm-4-25-11/fm-4-25-11.pdf" "$MEDICAL_DIR"
-
-# Wilderness medicine reference
-cat > "${MEDICAL_DIR}/medical_resources.txt" << 'EOF'
-Additional Medical References — Manual Download
-===============================================
-Hesperian Health Guides (FREE PDFs):
-  https://hesperian.org/books-and-resources/
-  - Where There Is No Doctor
-  - Where There Is No Dentist
-  - A Community Guide to Environmental Health
-  - Disabled Village Children
-  - Health Actions for Women
-
-Merck Manual (Public Domain older editions):
-  https://archive.org/search?query=merck+manual&mediatype=texts
-
-US Army Medical Field Manuals:
-  FM 8-10-6  Medical Evacuation
-  FM 8-285   Treatment of Chemical Agent Casualties
-  TM 8-227   Food Service Sanitation
-  (All on archive.org)
-EOF
+for OUTNAME in "${!MEDICAL[@]}"; do
+  URL="${MEDICAL[$OUTNAME]}"
+  OUTPATH="${MEDICAL_DIR}/${OUTNAME}"
+  if [[ -f "$OUTPATH" ]] && (( $(stat -c%s "$OUTPATH" 2>/dev/null || echo 0) > 10240 )); then
+    info "Already exists: $OUTNAME"
+    continue
+  fi
+  info "Downloading: $OUTNAME"
+  wget -q --show-progress -c -O "$OUTPATH" "$URL" \
+    && log "Done: $OUTNAME" \
+    || warn "Failed: $OUTNAME — get from https://hesperian.org/books-and-resources/"
+done
 
 log "Medical references complete"
 
-# ─── 5. FORAGING, AGRICULTURE & FOOD PRESERVATION ────────────────────────────
-section "5 / 8  —  Foraging, Agriculture & Food Preservation"
+# =============================================================================
+# 5 / 8 — FORAGING, AGRICULTURE & FOOD PRESERVATION
+# =============================================================================
+section "5 / 8  —  Foraging, Agriculture & Food"
 
-# Archive.org foraging books (public domain / open access)
-FORAGING_BOOKS=(
-  "https://archive.org/download/fieldguidetoedib0000pete_h5c3/fieldguidetoedib0000pete_h5c3.pdf"
-  "https://archive.org/download/completeguidetoe0000lyle/completeguidetoe0000lyle.pdf"
-  "https://archive.org/download/wildediblespract0000bout/wildediblespract0000bout.pdf"
+declare -A FORAGING=(
+  ["Peterson_Field_Guide_Edible_Plants.pdf"]="https://archive.org/download/fieldguidetoedib0000pete_h5c3/fieldguidetoedib0000pete_h5c3.pdf"
+  ["Complete_Guide_Edible_Wild_Plants.pdf"]="https://archive.org/download/completeguidetoe0000lyle/completeguidetoe0000lyle.pdf"
+  ["Wild_Edibles_Practical_Guide.pdf"]="https://archive.org/download/wildediblespract0000bout/wildediblespract0000bout.pdf"
+  ["USDA_Complete_Guide_Home_Canning.pdf"]="https://archive.org/download/usda-complete-guide-to-home-canning/usda-complete-guide-to-home-canning.pdf"
 )
 
-for URL in "${FORAGING_BOOKS[@]}"; do
-  dlw "$URL" "$FORAGING_DIR"
+for OUTNAME in "${!FORAGING[@]}"; do
+  dlw "${FORAGING[$OUTNAME]}" "$FORAGING_DIR" "$OUTNAME"
 done
 
-# USDA Complete Guide to Home Canning (food preservation bible)
-dlw "https://nchfp.uga.edu/publications/publications_usda.html" "$FORAGING_DIR" || true
-dlw "https://archive.org/download/usda-complete-guide-to-home-canning/usda-complete-guide-to-home-canning.pdf" "$FORAGING_DIR"
-
-# Project Gutenberg agriculture books
-info "Downloading Project Gutenberg agriculture books..."
-declare -A GUTENBERG_AG=(
-  ["Agriculture_for_Beginners"]="https://www.gutenberg.org/ebooks/5265.epub.images"
-  ["Cottage_Economy"]="https://www.gutenberg.org/ebooks/14905.epub.images"
-  ["First_Book_of_Farming"]="https://www.gutenberg.org/ebooks/10378.epub.images"
-  ["Culinary_Herbs"]="https://www.gutenberg.org/ebooks/26763.epub.images"
-  ["Elements_of_Agriculture"]="https://www.gutenberg.org/ebooks/24752.epub.images"
-  ["Manual_of_Gardening"]="https://www.gutenberg.org/ebooks/9550.epub.images"
-  ["Animal_Husbandry"]="https://www.gutenberg.org/ebooks/38185.epub.images"
-  ["Beekeeping"]="https://www.gutenberg.org/ebooks/32085.epub.images"
+declare -A GUTENBERG=(
+  ["Agriculture_for_Beginners.epub"]="https://www.gutenberg.org/ebooks/5265.epub.images"
+  ["Cottage_Economy.epub"]="https://www.gutenberg.org/ebooks/14905.epub.images"
+  ["First_Book_of_Farming.epub"]="https://www.gutenberg.org/ebooks/10378.epub.images"
+  ["Culinary_Herbs.epub"]="https://www.gutenberg.org/ebooks/26763.epub.images"
+  ["Manual_of_Gardening.epub"]="https://www.gutenberg.org/ebooks/9550.epub.images"
+  ["Beekeeping_for_Beginners.epub"]="https://www.gutenberg.org/ebooks/32085.epub.images"
+  ["Home_Canning_and_Preserving.epub"]="https://www.gutenberg.org/ebooks/30360.epub.images"
 )
 
-for TITLE in "${!GUTENBERG_AG[@]}"; do
-  URL="${GUTENBERG_AG[$TITLE]}"
-  OUTFILE="${AGRICULTURE_DIR}/${TITLE}.epub"
-  if [[ ! -f "$OUTFILE" ]]; then
-    wget -q --show-progress -c -O "$OUTFILE" "$URL" \
-      && log "Done: $TITLE" \
-      || warn "Failed: $TITLE"
-  else
-    info "Already exists: $TITLE"
-  fi
+for OUTNAME in "${!GUTENBERG[@]}"; do
+  dlw "${GUTENBERG[$OUTNAME]}" "$AGRICULTURE_DIR" "$OUTNAME"
 done
 
 log "Foraging & agriculture complete"
 
-# ─── 6. SURVIVOR LIBRARY ──────────────────────────────────────────────────────
-section "6 / 8  —  Survivor Library (Technical Skills)"
+# =============================================================================
+# 6 / 8 — SURVIVOR LIBRARY
+# =============================================================================
+section "6 / 8  —  Survivor Library"
 
-info "Downloading Survivor Library mirror from Archive.org..."
-info "This is ~6GB — please be patient..."
+SURVIVOR_DEST="${SURVIVAL_DIR}/survivor_library"
+mkdir -p "$SURVIVOR_DEST"
+EXISTING_COUNT=$(find "$SURVIVOR_DEST" -name "*.pdf" 2>/dev/null | wc -l)
 
-# Try rsync first (fastest for large collections), fall back to direct download
-if rsync --version &>/dev/null; then
-  rsync -avz --progress \
-    "rsync://archive.org/survival.library/" \
-    "${SURVIVAL_DIR}/survivor_library/" \
-    2>/dev/null \
-    && log "Survivor Library sync complete" \
-    || {
-      warn "rsync failed — trying direct archive download"
-      dl "https://archive.org/compress/survival.library/formats=PDF&file=/survival.library.zip" "$SURVIVAL_DIR"
-    }
+if (( EXISTING_COUNT > 100 )); then
+  info "Survivor Library already downloaded (${EXISTING_COUNT} PDFs) — skipping"
 else
-  dl "https://archive.org/compress/survival.library/formats=PDF&file=/survival.library.zip" "$SURVIVAL_DIR"
+  info "Syncing Survivor Library from archive.org (~6GB)..."
+  if rsync --version &>/dev/null; then
+    rsync -avz --progress --timeout=60 \
+      "rsync://archive.org/survival.library/" "$SURVIVOR_DEST/" 2>/dev/null \
+      && log "Survivor Library complete" \
+      || {
+        warn "rsync failed — downloading compressed archive..."
+        dl "https://archive.org/compress/survival.library/formats=PDF" "$SURVIVAL_DIR"
+      }
+  else
+    dl "https://archive.org/compress/survival.library/formats=PDF" "$SURVIVAL_DIR"
+  fi
 fi
-
-# Key individual categories also available directly at:
-cat > "${SURVIVAL_DIR}/manual_downloads.txt" << 'EOF'
-Survivor Library — Category Downloads
-======================================
-Visit: https://www.survivorlibrary.com/index.php/main-library-index/
-Each category has a ZIP file with all books in that section.
-
-Priority categories for survival:
-  Survival_Individual    (~588MB ZIP)
-  Farming                (~200MB ZIP)
-  Farming2               (~150MB ZIP)
-  Medical_Emergency      (~100MB ZIP)
-  Medical_Medicine_1900  (~300MB ZIP)
-  Butchering             (~50MB ZIP)
-  Canning                (~80MB ZIP)
-  Engineering_General    (~250MB ZIP)
-  Engineering_Electrical (~200MB ZIP)
-  Steam_Engines          (~100MB ZIP)
-  Machine_Tools          (~150MB ZIP)
-  Smithing               (~80MB ZIP)
-  Firearms_Books         (~200MB ZIP)
-  Livestock              (~300MB ZIP combined)
-  Forestry               (~100MB ZIP)
-  Fishing                (~80MB ZIP)
-  Food                   (~150MB ZIP)
-EOF
 
 log "Survivor Library complete"
 
-# ─── 7. GAMES (OPTIONAL) ──────────────────────────────────────────────────────
-section "7 / 8  —  Games & Entertainment"
+# =============================================================================
+# 7 / 8 — ENTERTAINMENT
+# =============================================================================
+section "7 / 8  —  Entertainment"
 
 if [[ "$SKIP_GAMES" == "true" ]]; then
-  warn "Skipping games (--skip-games)"
+  warn "Skipping entertainment (--skip-games)"
 else
-  # Install RetroPie dependencies
-  info "Installing game emulation stack..."
-  sudo apt-get install -y retroarch libretro-* 2>/dev/null \
-    || warn "RetroArch packages not found in apt — install manually"
-
-  # Open-source / public domain games (100% legal)
   info "Installing open source games..."
   sudo apt-get install -y \
-    0ad \
-    freeciv-client-gtk \
-    openttd \
-    supertuxkart \
-    minetest \
-    wesnoth \
-    freesweep \
-    nethack-console \
-    2>/dev/null || warn "Some games not available in apt — check manually"
+    openttd supertuxkart minetest wesnoth nethack-console dosbox \
+    2>/dev/null || warn "Some game packages unavailable"
 
-  # Legal MAME ROMs from MAMEdev
-  info "Downloading legal freeware MAME ROMs..."
-  mkdir -p "${GAMES_DIR}/mame_roms"
-  cat > "${GAMES_DIR}/mame_roms/download_legal_roms.txt" << 'EOF'
-Legal / Freeware MAME ROMs
-===========================
-Download from official sources:
+  cat > "${GAMES_DIR}/LEGAL_ROM_SOURCES.txt" << 'EOF'
+Legal Game ROM Sources
+======================
+1. MAMEDev Freeware: https://www.mamedev.org/roms/
+2. Public Domain ROMs: https://www.zophar.net/pdroms.html
+3. Homebrew: https://www.romhacking.net/homebrew/
+4. DOS Games Archive: https://archive.org/details/softwarelibrary_msdos_games
+5. Open source (installed): OpenTTD, SuperTuxKart, Minetest, Wesnoth, NetHack
 
-1. MAMEDev Freeware ROMs:
-   https://www.mamedev.org/roms/
-   (Games officially released as freeware by rights holders)
-
-2. Public Domain ROMs:
-   https://www.zophar.net/pdroms.html
-   https://pdroms.de/
-
-3. Homebrew Games (free, no copyright issues):
-   https://www.romhacking.net/homebrew/
-   https://itch.io/games/free (many free indie games)
-
-4. DOS Games (many now free):
-   https://archive.org/details/softwarelibrary_msdos_games
-   (Use DOSBox emulator — install with: sudo apt install dosbox)
+Place ROMs in: entertainment/games/roms/<console>/
 EOF
 
-  # DOSBox for classic DOS games
-  sudo apt-get install -y dosbox 2>/dev/null || true
-
-  # Public domain comics from Digital Comic Museum
-  info "Creating comic download reference..."
-  mkdir -p "${COMICS_DIR}"
-  cat > "${COMICS_DIR}/download_comics.txt" << 'EOF'
-Public Domain Comics — Free & Legal
+  cat > "${COMICS_DIR}/COMIC_SOURCES.txt" << 'EOF'
+Public Domain Comics (Free & Legal)
 =====================================
-All pre-1928 comics are public domain in the US.
+1. Digital Comic Museum: https://digitalcomicmuseum.com
+2. Comic Book Plus: https://comicbookplus.com
+3. Internet Archive: https://archive.org/details/comics
 
-Sources:
-  1. Digital Comic Museum: https://digitalcomicmuseum.com
-     - Golden Age comics (1930s-1950s)
-     - Thousands of issues, completely free
-
-  2. Comic Book Plus: https://comicbookplus.com
-     - More Golden Age public domain comics
-
-  3. Internet Archive Comics:
-     https://archive.org/details/comics
-     - Massive collection, many public domain
-
-Download tool (while online):
-  pip3 install gallery-dl
-  gallery-dl https://digitalcomicmuseum.com/preview/index.php?did=XXXX
-
-Organize into /comics/<Series>/<Issue>.cbz for Komga/Kavita
+Download tool: pip3 install gallery-dl
+Format: .cbz files, place in entertainment/comics/<Series>/<Issue>.cbz
+Server: Komga (java -jar komga.jar) on port 8081
 EOF
-
-  # Install Komga (comic server)
-  if command -v java &>/dev/null || command -v docker &>/dev/null; then
-    info "Setting up Komga comic server..."
-    mkdir -p "${COMICS_DIR}/komga_config"
-    KOMGA_VERSION=$(curl -s --max-time 10 "https://api.github.com/repos/gotson/komga/releases/latest" 2>/dev/null | grep -oP '"tag_name": "\K[^"]+' || true)
-    KOMGA_VERSION="${KOMGA_VERSION:-latest}"
-    cat > "${COMICS_DIR}/start_komga.sh" << KOMGAEOF
-#!/bin/bash
-# Start Komga comic server
-# Download Komga JAR first: https://github.com/gotson/komga/releases/latest
-# Place komga.jar in this directory, then run this script
-
-JAR_PATH="\$(dirname "\$0")/komga.jar"
-
-if [[ ! -f "\$JAR_PATH" ]]; then
-  echo "Downloading Komga..."
-  KOMGA_URL=\$(curl -s --max-time 10 "https://api.github.com/repos/gotson/komga/releases/latest" \
-    2>/dev/null | grep -oP '"browser_download_url": "\K[^"]+komga[^"]+\.jar' | head -1 || true)
-  if [[ -z "\$KOMGA_URL" ]]; then
-    echo "Could not auto-detect Komga URL. Download manually from:"
-    echo "  https://github.com/gotson/komga/releases/latest"
-    exit 1
-  fi
-  wget -O "\$JAR_PATH" "\$KOMGA_URL"
+  log "Entertainment setup complete"
 fi
 
-java -jar "\$JAR_PATH" \
-  --server.port=8080 \
-  --komga.libraries-scan-cron="0 */15 * * * ?" \
-  --spring.datasource.url="jdbc:h2:file:${COMICS_DIR}/komga_config/database"
-KOMGAEOF
-    chmod +x "${COMICS_DIR}/start_komga.sh"
-    log "Komga setup complete — run ${COMICS_DIR}/start_komga.sh to start"
-  fi
-
-  log "Games & entertainment setup complete"
-fi
-
-# ─── 8. LOCAL AI (OPTIONAL) ───────────────────────────────────────────────────
-section "8 / 8  —  Local AI (Offline LLM)"
+# =============================================================================
+# 8 / 8 — LOCAL AI
+# =============================================================================
+section "8 / 8  —  Local AI (Ollama)"
 
 if [[ "$SKIP_AI" == "true" ]]; then
   warn "Skipping AI (--skip-ai)"
 else
-  # Install Ollama
   if ! command -v ollama &>/dev/null; then
     info "Installing Ollama..."
     curl -fsSL https://ollama.com/install.sh | sh \
       && log "Ollama installed" \
-      || warn "Ollama install failed — try manually: curl -fsSL https://ollama.com/install.sh | sh"
+      || warn "Install failed — run: curl -fsSL https://ollama.com/install.sh | sh"
   else
     log "Ollama already installed"
   fi
 
   if command -v ollama &>/dev/null; then
-    # Start Ollama service
-    ollama serve &>/dev/null &
-    sleep 3
+    pgrep -x ollama &>/dev/null || { ollama serve &>/dev/null & sleep 4; }
 
-    # Pull Phi-3 Mini — best model for Pi 5 (3.8B params, ~2.3GB at Q4)
-    info "Pulling Phi-3 Mini model (~2.3GB — optimized for Pi 5)..."
+    info "Pulling Phi-3 Mini (~2.3GB)..."
     ollama pull phi3:mini \
-      && log "Phi-3 Mini model ready" \
-      || warn "Model pull failed — run manually: ollama pull phi3:mini"
+      && log "Phi-3 Mini ready" \
+      || warn "Model pull failed — run: ollama pull phi3:mini"
 
-    # Create a survival-tuned system prompt
-    mkdir -p "${AI_DIR}"
-    cat > "${AI_DIR}/survival_assistant.sh" << 'AIEOF'
+    mkdir -p "$AI_DIR"
+    cat > "${AI_DIR}/survival_system_prompt.txt" << 'PROMPT'
+You are OUTPOST AI — an expert offline survival assistant.
+
+SURVIVAL: Wilderness survival, shelter, fire, navigation by stars/sun/compass, signalling.
+FORAGING: Edible plants by region, mushrooms, dangerous look-alikes, preparation methods.
+MEDICINE: Field medicine, wound care, first aid, triage, shock, fractures, infections.
+         Always note "seek professional care when possible" for serious conditions.
+FARMING: Crop growing, companion planting, soil, seed saving, composting, irrigation.
+ANIMALS: Hunting, trapping, fishing, husbandry, butchering, curing and smoking meat.
+FOOD PRESERVATION: Canning, fermentation, smoking, drying, root cellaring, salt-curing.
+REPAIR: Mechanical repair, engines, pumps, generators, basic electronics, improvised tools.
+NAVIGATION: Map reading, compass, celestial navigation, terrain reading, dead reckoning.
+CONSTRUCTION: Shelter from natural materials, log cabin basics, adobe, waterproofing.
+WATER: Finding, purifying, and storing water in any environment.
+
+Give practical, actionable advice. Be concise but complete. Prioritise safety.
+Warn about dangerous plant/fungi look-alikes. Assume limited tools and supplies.
+PROMPT
+
+    cat > "${AI_DIR}/survival_ai.sh" << 'LAUNCHER'
 #!/bin/bash
-# Survival AI Assistant — powered by Ollama (fully offline)
-# Usage: ./survival_assistant.sh
-
-SYSTEM_PROMPT="You are an expert survival assistant with deep knowledge of:
-- Wilderness survival, shelter building, fire starting, navigation
-- Edible plants, foraging, hunting, fishing, trapping
-- Field medicine, wound care, improvised first aid
-- Off-grid farming, food preservation, animal husbandry
-- Mechanical repair, engines, pumps, basic electronics
-- Weather reading, navigation by stars, map reading
-Always give practical, actionable advice. Prioritize safety. 
-When discussing plants or medicine, always warn about dangerous look-alikes or risks."
-
-echo "============================================"
-echo "  SURVIVAL AI ASSISTANT (Offline)"
-echo "  Model: phi3:mini | Type 'exit' to quit"
-echo "============================================"
-echo ""
-
-ollama run phi3:mini --system "$SYSTEM_PROMPT"
-AIEOF
-    chmod +x "${AI_DIR}/survival_assistant.sh"
-    log "Survival AI assistant configured at ${AI_DIR}/survival_assistant.sh"
+SYSTEM=$(cat "$(dirname "$0")/survival_system_prompt.txt")
+echo "=============================="
+echo "  OUTPOST AI — Offline Mode"
+echo "  Model: phi3:mini"
+echo "  Type 'exit' to quit"
+echo "=============================="
+pgrep -x ollama &>/dev/null || { ollama serve &>/dev/null & sleep 3; }
+ollama run phi3:mini --system "$SYSTEM"
+LAUNCHER
+    chmod +x "${AI_DIR}/survival_ai.sh"
+    log "AI assistant: ${AI_DIR}/survival_ai.sh"
   fi
 fi
 
-# ─── SETUP KIWIX AUTO-START ───────────────────────────────────────────────────
-section "Setting Up Services"
+# =============================================================================
+# KIWIX LIBRARY + SYSTEMD
+# =============================================================================
+section "Setting Up Kiwix Server"
 
-# Create kiwix-serve systemd service
-info "Creating kiwix-serve systemd service..."
-sudo tee /etc/systemd/system/kiwix-serve.service > /dev/null << SVCEOF
+if command -v kiwix-manage &>/dev/null; then
+  LIBRARY_XML="${ZIM_DIR}/library.xml"
+  rm -f "$LIBRARY_XML"
+  ZIM_COUNT=0
+  for ZIM in "${ZIM_DIR}"/*.zim; do
+    [[ -f "$ZIM" ]] && kiwix-manage "$LIBRARY_XML" add "$ZIM" 2>/dev/null \
+      && (( ZIM_COUNT++ )) || true
+  done
+  log "Kiwix library: ${ZIM_COUNT} ZIMs indexed"
+
+  sudo tee /etc/systemd/system/kiwix-serve.service > /dev/null << EOF
 [Unit]
 Description=Kiwix Offline Knowledge Server
 After=network.target
-
 [Service]
 Type=simple
 User=${USER}
-ExecStart=/usr/bin/kiwix-serve --port=8080 --library ${ZIM_DIR}/library.xml
+ExecStart=/usr/bin/kiwix-serve --port=8080 --library ${LIBRARY_XML}
 Restart=on-failure
 RestartSec=5
-
 [Install]
 WantedBy=multi-user.target
-SVCEOF
-
-# Build kiwix library index from all downloaded ZIMs
-if command -v kiwix-manage &>/dev/null; then
-  info "Building Kiwix library index..."
-  LIBRARY_FILE="${ZIM_DIR}/library.xml"
-  # Remove old library
-  rm -f "$LIBRARY_FILE"
-  # Add all ZIMs
-  for ZIM in "${ZIM_DIR}"/*.zim; do
-    [[ -f "$ZIM" ]] && kiwix-manage "$LIBRARY_FILE" add "$ZIM" 2>/dev/null && log "Added to library: $(basename $ZIM)"
-  done
+EOF
   sudo systemctl daemon-reload
-  sudo systemctl enable kiwix-serve
-  sudo systemctl start kiwix-serve
-  log "Kiwix server running at http://localhost:8080"
+  sudo systemctl enable kiwix-serve 2>/dev/null || true
+  sudo systemctl restart kiwix-serve 2>/dev/null \
+    && log "Kiwix running at http://localhost:8080" \
+    || warn "Could not start kiwix — run: sudo systemctl start kiwix-serve"
 fi
 
-# ─── FINAL SUMMARY ────────────────────────────────────────────────────────────
-section "Download Complete!"
+# =============================================================================
+# FINAL SUMMARY
+# =============================================================================
+section "Complete!"
 
-echo ""
 echo -e "${BOLD}Storage used:${RESET}"
-du -sh "${BASE_DIR}"/* 2>/dev/null | sort -h
+du -sh "${BASE_DIR}"/*/  2>/dev/null | sort -h
 
 echo ""
-echo -e "${BOLD}Services:${RESET}"
-echo -e "  ${GREEN}📚 Kiwix (Wikipedia, iFixit, Wikibooks...)${RESET}  → http://localhost:8080"
-echo -e "  ${GREEN}🗺️  Maps data${RESET}                               → ${MAPS_DIR}"
-echo -e "  ${GREEN}📖 Manuals & books${RESET}                          → ${MANUALS_DIR}"
-[[ "$SKIP_GAMES" == "false" ]] && echo -e "  ${GREEN}🎮 Comics server${RESET}                            → ${COMICS_DIR}/start_komga.sh"
-[[ "$SKIP_AI" == "false" ]] && echo -e "  ${GREEN}🤖 Survival AI${RESET}                              → ${AI_DIR}/survival_assistant.sh"
+echo -e "${BOLD}ZIM files:${RESET}"
+find "$ZIM_DIR" -name "*.zim" -size +1M 2>/dev/null | sort | \
+  while read -r f; do
+    printf "  %-65s %s\n" "$(basename "$f")" "$(du -sh "$f" 2>/dev/null | cut -f1)"
+  done
 
 echo ""
-echo -e "${BOLD}Next steps:${RESET}"
-echo "  1. Run the GUI setup:  ./survival_pi_gui.sh"
-echo "  2. Add your comics/books to ${COMICS_DIR} and ${BOOKS_DIR}"
-echo "  3. Download additional content listed in the .txt reference files"
-echo "  4. Access Kiwix at http://localhost:8080 from any device on your network"
+echo -e "${BOLD}Any failures (re-run to retry):${RESET}"
+grep "^\[!\]" "$LOG_FILE" 2>/dev/null | tail -20 || echo "  None!"
+
 echo ""
-echo -e "${CYAN}Log saved to: ${LOG_FILE}${RESET}"
-echo ""
+echo -e "${CYAN}Log: ${LOG_FILE}${RESET}"
+echo -e "${CYAN}Re-run anytime to resume or retry failed downloads.${RESET}"
